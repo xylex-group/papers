@@ -1,0 +1,357 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{parskip}
+
+\title{Athena Runtime Architecture \\ \large A Technical Analysis of Async Database Drivers in Rust}
+\author{Floris \\ XYLEX GROUP}
+\date{April 2025}
+
+\begin{document}
+
+\maketitle
+
+\begin{center}
+\textit{Building better worlds}
+\end{center}
+
+\tableofcontents
+\newpage
+
+\section{Executive Summary}
+
+This document defines the runtime and architectural foundations of \textbf{Athena}, a Rust-based database gateway and driver system developed by XYLEX GROUP.
+
+The core conclusion is:
+
+\begin{quote}
+\textbf{All database I/O in Athena must be built on Tokio with non-blocking async.}
+\end{quote}
+
+Rayon is retained only for CPU-bound post-processing. Blocking execution models are explicitly excluded from the core architecture.
+
+Athena is not a traditional driver. It is a:
+
+\begin{itemize}
+\item multi-backend database gateway
+\item routing layer with per-request client resolution
+\item operational control plane (backups, provisioning, metrics)
+\item unified query interface across PostgreSQL, ScyllaDB, Supabase
+\end{itemize}
+
+The system is designed for high concurrency, observability, and operational control.
+
+\newpage
+
+\section{System Overview}
+
+Athena exposes a unified API surface that routes requests dynamically to multiple backend databases.
+
+\subsection{Core Capabilities}
+
+\begin{itemize}
+\item Gateway CRUD operations (\texttt{/gateway/*})
+\item Multi-backend routing (Postgres, Scylla, Supabase)
+\item In-memory client registry with hot reload
+\item Deferred query queue
+\item Admission control and rate limiting
+\item In-process + Redis caching
+\item API key system with granular rights
+\item Backup and restore (S3-compatible)
+\item Schema management and provisioning
+\item Metrics (Prometheus)
+\item WebSocket gateway
+\end{itemize}
+
+\subsection{Gateway Surface}
+
+\begin{itemize}
+\item POST /gateway/fetch
+\item PUT /gateway/insert
+\item POST /gateway/update
+\item DELETE /gateway/delete
+\item POST /gateway/query
+\end{itemize}
+
+All operations are routed via:
+
+\begin{itemize}
+\item \texttt{X-Athena-Client}
+\item wildcard host routing
+\item public route mappings
+\end{itemize}
+
+\newpage
+
+\section{Architecture}
+
+\subsection{High-Level Architecture}
+
+\begin{verbatim}
+%% Mermaid Diagram
+flowchart LR
+    A[Client / API Consumer] --> B[Athena Gateway]
+    B --> C[Routing Registry]
+    C --> D[PostgreSQL Pool]
+    C --> E[ScyllaDB Cluster]
+    C --> F[Supabase REST/RPC]
+
+    B --> G[Cache Layer (Moka/Redis)]
+    B --> H[Deferred Queue]
+    B --> I[Metrics + Logging]
+\end{verbatim}
+
+\subsection{Runtime Architecture}
+
+\begin{verbatim}
+%% Mermaid Diagram
+flowchart TD
+    A[Incoming Request] --> B[Tokio Runtime]
+
+    B --> C[Async Query Execution]
+    C --> D[Database Backend]
+
+    D --> E[Async Result Stream]
+
+    E --> F{Post Processing?}
+    F -->|No| G[Return Response]
+    F -->|Yes| H[Rayon CPU Processing]
+    H --> G
+\end{verbatim}
+
+\newpage
+
+\section{Runtime Model Analysis}
+
+\subsection{Rejected Model: Blocking + Rayon}
+
+\begin{itemize}
+\item Uses \texttt{spawn\_blocking} for I/O
+\item Consumes OS threads per request
+\item Limited scalability
+\item Poor cancellation semantics
+\end{itemize}
+
+\textbf{Conclusion: Not suitable for Athena core.}
+
+\subsection{Selected Model: Tokio Async}
+
+\begin{itemize}
+\item Event-driven I/O
+\item Minimal threads
+\item High concurrency
+\item Native streaming + backpressure
+\end{itemize}
+
+\textbf{Conclusion: Required for all gateway operations.}
+
+\subsection{Rayon Role}
+
+Rayon is used only for:
+
+\begin{itemize}
+\item aggregation (group\_by)
+\item transformation pipelines
+\item heavy JSON processing
+\end{itemize}
+
+Never used for:
+
+\begin{itemize}
+\item database I/O
+\item connection handling
+\item request routing
+\end{itemize}
+
+\newpage
+
+\section{Core System Components}
+
+\subsection{Client Registry}
+
+\begin{itemize}
+\item Backed by \texttt{athena\_clients} table
+\item Merged with config.yaml
+\item Stored in in-memory registry
+\item Hot reload without restart
+\end{itemize}
+
+\subsection{Deferred Query Queue}
+
+\begin{verbatim}
+%% Mermaid Diagram
+flowchart LR
+    A[Request] --> B{Rate Limit Hit}
+    B -->|Yes| C[Deferred Queue DB]
+    C --> D[Worker]
+    D --> E[Execute Query]
+    E --> F[Store Result]
+\end{verbatim}
+
+\subsection{Caching Layer}
+
+\begin{itemize}
+\item Local cache: moka
+\item Optional Redis write-through
+\item Keyed by client + query
+\item Auto-invalidation on writes
+\end{itemize}
+
+\subsection{Admission Control}
+
+\begin{itemize}
+\item Token bucket limiter
+\item Global + per-client limits
+\item Optional auto-deferral
+\end{itemize}
+
+\newpage
+
+\section{Gateway Execution Flow}
+
+\begin{verbatim}
+%% Mermaid Diagram
+sequenceDiagram
+    participant C as Client
+    participant G as Gateway
+    participant R as Registry
+    participant DB as Database
+
+    C->>G: Request (X-Athena-Client)
+    G->>R: Resolve client
+    R-->>G: Connection Pool
+    G->>DB: Execute query (async)
+    DB-->>G: Stream rows
+    G-->>C: Response
+\end{verbatim}
+
+\newpage
+
+\section{Observability}
+
+\subsection{Metrics}
+
+\begin{itemize}
+\item request count
+\item error rate
+\item latency histograms
+\item queue depth
+\item client-level stats
+\end{itemize}
+
+\subsection{Logging}
+
+\begin{itemize}
+\item gateway\_operation\_log
+\item pipeline\_step\_log
+\item api\_key\_auth\_log
+\end{itemize}
+
+\subsection{Tokio Console}
+
+Enabled via:
+
+\begin{verbatim}
+RUSTFLAGS="--cfg tokio_unstable"
+--features tokio-console
+\end{verbatim}
+
+Provides:
+
+\begin{itemize}
+\item task scheduling insight
+\item async bottleneck detection
+\end{itemize}
+
+\newpage
+
+\section{Security Model}
+
+\subsection{API Keys}
+
+\begin{itemize}
+\item format: \texttt{ath\_{public}.{secret}}
+\item hashed storage
+\item per-client scoping
+\item rights-based permissions
+\end{itemize}
+
+\subsection{IP Policies}
+
+\begin{itemize}
+\item whitelist / blacklist
+\item CIDR support
+\item virgin mode learning
+\end{itemize}
+
+\subsection{Audit Logging}
+
+\begin{itemize}
+\item full DDL tracking
+\item request metadata
+\item trace IDs
+\end{itemize}
+
+\newpage
+
+\section{Key Design Principles}
+
+\begin{itemize}
+\item Async-first architecture
+\item Zero blocking in hot path
+\item Registry-driven routing
+\item Database-agnostic interface
+\item Observability by default
+\item Operational control built-in
+\end{itemize}
+
+\newpage
+
+\section{Conclusion}
+
+Athena is architected as a high-performance database gateway built around modern Rust async principles.
+
+The fundamental constraints are:
+
+\begin{itemize}
+\item Database workloads are I/O bound
+\item Blocking models do not scale
+\item Async execution is required for correctness under load
+\end{itemize}
+
+The resulting architecture is:
+
+\begin{itemize}
+\item Tokio for all I/O
+\item Rayon for isolated CPU workloads
+\item Strong separation between transport and processing
+\end{itemize}
+
+This design ensures Athena remains scalable, predictable, and maintainable under real-world load.
+
+\newpage
+
+\section{References}
+
+\begin{itemize}
+\item Tokio Documentation
+\item Rayon Documentation
+\item Rust Async Book
+\item SQLx
+\item tokio-postgres
+\end{itemize}
+
+\vfill
+
+\begin{center}
+© 2025 XYLEX GROUP \\
+Building better worlds
+\end{center}
+
+\end{document}
