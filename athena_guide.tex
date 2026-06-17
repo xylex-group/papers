@@ -1,0 +1,186 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{parskip}
+
+\title{Athena Runtime Architecture \\ \large A Technical Analysis of Async Database Drivers in Rust}
+\author{Floris \\ XYLEX GROUP}
+\date{April 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{center}
+\textit{Building better worlds}
+\end{center}
+
+\tableofcontents
+\newpage
+
+\section{Executive Summary}
+
+Athena is a multi–backend database gateway and runtime designed to provide unified CRUD and query access to SQL and NoSQL backends over HTTP.  The platform is implemented in Rust with extensive support for asynchronous execution, connection pooling and deferment to handle high concurrency workloads.  It is complemented by an authentication framework (\emph{Athena Auth}) for session and API key management, a Kubernetes operator for in‑cluster deployment, and client SDKs for JavaScript/TypeScript, Python and other languages.  This report surveys the architecture of Athena’s server and associated components, analyses the asynchronous driver layer in Rust, and outlines best practices for deploying clusters and consuming the API through SDKs.
+
+\section{The Athena Ecosystem}
+
+\subsection{Overview of the Platform}
+
+Athena exposes a gateway API that abstracts away direct database connections.  Core CRUD operations—\texttt{fetch}, \texttt{data}, \texttt{insert}, \texttt{update}, \texttt{delete} and \texttt{query}—accept structured JSON payloads and route requests to the correct database backend based on the \texttt{X‑Athena‑Client} header.  The server supports three backend families: PostgreSQL (via SQLx or deadpool‑experimental pools), ScyllaDB/Apache Cassandra (via native CQL driver) and Supabase REST/RPC interfaces.  New clients can be registered at runtime through a database‑backed catalog; the catalog merges with configuration from \texttt{config.yaml} and is kept in a hot in‑memory registry.
+
+The broader ecosystem includes:
+\begin{itemize}
+  \item \textbf{Athena Auth} – a modular authentication framework with route parity for email/password, OAuth, sessions, password reset, email verification, 2FA and passkeys.  It is implemented as a set of Rust crates and exposes a pluggable Axum API with multi‑tenancy support.
+  \item \textbf{SDKs} – client libraries for JavaScript/TypeScript (\texttt{@xylex-group/athena}) and Python (\texttt{athena-py}) that mirror the gateway surface.  The JS SDK offers a fluent query builder and React hooks, while the Python SDK provides async methods like \texttt{from\_()}, \texttt{rpc()} and \texttt{query()}.
+  \item \textbf{Operator and MCP} – a Go‑based Kubernetes operator for deploying and reconciling Athena resources in a cluster, and a model context protocol (\texttt{athena-mcp}) that exposes the management API as tools for AI coding assistants.
+\end{itemize}
+
+\subsection{Core Architectural Styles}
+
+The Athena server follows a layered architecture.  High‑level architectural styles identified in the internal documentation include:
+\begin{itemize}
+  \item \textbf{Layered core} – separation between API ingress, gateway routing, driver adapters and supporting subsystems.
+  \item \textbf{Gateway routing} – resolution of the target client and backend from request headers.
+  \item \textbf{Driver adapter} – pluggable driver layer for PostgreSQL, Scylla and Supabase.
+  \item \textbf{Registry and pooling} – in‑memory client registry backed by SQL tables and connection pools per client.
+  \item \textbf{Cache and invalidation} – local \texttt{moka} cache with optional Redis write‑through for read paths.
+  \item \textbf{Deferred execution} – admission‑controlled deferred job queue for spikes.
+  \item \textbf{ETL pipeline} – config‑driven extract‑transform‑load flows.
+  \item \textbf{Auth/tenant context} – header‑based tenant resolution integrated with the authentication framework.
+  \item \textbf{Observability and audit} – detailed operation logs, metrics and vacuum health monitoring.
+  \item \textbf{Realtime websocket} – optional WebSocket gateway for realtime change data capture.
+  \item \textbf{Multi‑app workspace} – monorepo of apps (gateway, desktop, docs, studio) and packages.
+  \item \textbf{Container runtime} – containerised deployment with optional daemon for background workers.
+\end{itemize}
+
+\section{Athena Gateway Server}
+
+\subsection{Endpoint Surface}
+
+Athena exposes five primary gateway endpoints:
+\begin{description}
+  \item[\texttt{POST /gateway/fetch} and \texttt{/gateway/data}] Retrieve rows from a table or view with support for column selection, filters, ordering and pagination.  \texttt{/gateway/data} adds optional aggregate support.
+  \item[\texttt{PUT /gateway/insert}] Insert one or more rows and return the inserted record.
+  \item[\texttt{POST /gateway/update}] Apply field‑level changes to rows matching supplied conditions.
+  \item[\texttt{DELETE /gateway/delete}] Remove rows matching conditions.
+  \item[\texttt{POST /gateway/query}] Execute arbitrary SQL and stream the result set.  All operations use header‑based routing to select the logical client and thus the backend pool.
+\end{description}
+
+Beyond basic CRUD, Athena includes advanced features:
+\begin{itemize}
+  \item \textbf{Response post‑processing}: grouping and aggregation in‑process with time granularity options (minute/hour/day/week/month).
+  \item \textbf{Deferred queries}: requests can be enqueued when rate limits are hit or when callers set \texttt{X‑Athena‑Defer: true}.  A background worker polls the queue and executes jobs with retry semantics.
+  \item \textbf{Admission control}: token‑bucket limiter configurable per client or globally.  Exceeded requests are either rejected or deferred, and events are recorded in \texttt{admission\_events}.
+  \item \textbf{In‑process cache with optional Redis}: keyed on client/table/params, invalidated on write operations.  Redis write‑through persists the cache across instances.
+  \item \textbf{API key management}: keys scoped to clients with capability rights and expiry.  Keys can be created, updated and deleted; enforcement and per‑client overrides are configurable, and auth logs record all attempts.
+  \item \textbf{Statistics and drill‑down}: aggregated counts per client and per table are exposed via admin endpoints; materialised views can be refreshed on demand.
+  \item \textbf{Backups and restore}: S3‑compatible backups using \texttt{pg\_dump} and \texttt{pg\_restore}, with schedule automation and retention policies.
+  \item \textbf{Vacuum health and query optimization}: periodic snapshots of table bloat and transaction age, and analysis of slow queries to suggest index creation.
+  \item \textbf{Schema provisioning}: applying the logging schema on a new Postgres instance and optionally registering the client.
+\end{itemize}
+
+\subsection{Request Lifecycle and Performance Strategies}
+
+A typical request path proceeds as follows:
+\begin{enumerate}
+  \item Parse the route and headers.
+  \item Resolve tenant and client context using header values.
+  \item Build an operation model from the JSON body.
+  \item Execute the operation via the appropriate driver and connection pool.
+  \item Normalise results into a standard success/error envelope.
+  \item Emit log records and metrics.
+\end{enumerate}
+
+Performance guidance emphasises reusing connection pools per logical client, caching read‑intensive routes, deferring work during pressure spikes and avoiding unnecessary cache invalidation when requests are no‑ops.  With asynchronous Rust (`tokio`) at its core, the gateway can handle thousands of concurrent connections.  Each client’s connection pool is configured based on environment and configuration values; when a client is added or updated at runtime the registry creates or rebuilds the pool accordingly.
+
+\subsection{Async Driver Layer in Rust}
+
+The heart of Athena’s architecture is its driver adapter layer.  Postgres connectivity is handled using the \texttt{sqlx} library (with optional \texttt{deadpool\_experimental} for high concurrency).  Each logical client has an associated pool; operations are executed against those pools using asynchronous Rust functions.  When a request targets ScyllaDB or Apache Cassandra, Athena uses the native CQL driver to perform queries; for Supabase, it issues HTTP calls against the REST and RPC endpoints and wraps them in a circuit breaker to avoid cascading failures.  Drivers convert results into a unified internal row format which the gateway transforms into JSON responses.
+
+Async execution ensures that threads are not blocked on I/O, enabling thousands of simultaneous queries.  Pool configuration (max size, timeouts, retries) is loaded from configuration and environment variables at boot.  The registry monitors pool health and can reconnect or rebalance pools when connections fail.  Deferred execution and admission control use background workers to offload heavy or slow queries to asynchronous tasks, smoothing pressure on the main request handlers.  Together, these mechanisms deliver high throughput and resilience.
+
+\subsection{Client Registry and Pooling}
+
+Client definitions are specified in \texttt{config.yaml} and persisted to the \texttt{athena\_clients} table.  The configuration layer supports environment variable interpolation, meaning connection URIs are stored as tokens and resolved at runtime.  On startup, the bootstrap process merges file and database definitions, establishes pools for each active client and populates an in‑memory registry.  Administrators can create, update, freeze or delete clients via \texttt{POST /admin/clients}; changes propagate into the registry without restarting the server.  Frozen clients are evicted from the registry and no longer receive traffic.
+
+\section{Authentication and Tenant Context}
+
+\subsection{Athena Auth Framework}
+
+Athena Auth provides authentication and session management aligned with the gateway.  The framework delivers route parity with common flows—email/password registration and login, OAuth, sessions, password reset, email verification, two‑factor authentication and passkeys—and surfaces admin endpoints for user and organization management.  The codebase is modular: \texttt{crates/core} defines types, adapters and an OpenAPI builder, while \texttt{crates/api} implements plugin routes.  API coverage tables in the README enumerate each path and its implementation status.  The server produces an aggregated OpenAPI document at runtime.
+
+\subsection{Multi‑Tenancy Design}
+
+Athena Auth can host multiple tenant runtimes in one process.  The multitenancy design keeps tenant configuration and header resolution in a dedicated crate and converts Axum requests into internal auth requests at a single point.  A registry maps tenant identifiers to `Arc<AthenaAuth>` instances, each configured with its own database URL, search path and schema mapping.  When a request arrives, dispatch logic resolves the tenant from headers, retrieves the appropriate runtime and forwards the request; the response is tagged with the resolved tenant.  This design enforces strict boundaries between tenants while sharing the server process and avoids duplicated routing logic.
+
+\section{Client SDKs}
+
+\subsection{JavaScript/TypeScript SDK (\texttt{@xylex-group/athena})}
+
+The official JS/TS SDK is versioned separately from the server and currently at \texttt{2.7.0}.  It acts as a database driver and API gateway client that communicates with Athena over HTTP.  The package offers a fluent builder API, a typed query builder for Node.js environments and optional React hooks for client‑side applications.  Users install it via \texttt{npm}, \texttt{pnpm} or \texttt{yarn}.
+
+Creating a client involves specifying the Athena base URL, an API key and the logical client name.  Once instantiated, you can call \texttt{from(table).findMany({...})}, \texttt{insert()}, \texttt{update()}, \texttt{delete()}, \texttt{rpc()}, \texttt{query()} and other methods.  The SDK mirrors authentication headers: if a request includes \texttt{Cookie} or \texttt{Authorization: Bearer} headers, the SDK adds \texttt{X‑Athena‑Auth‑Session‑Token} or \texttt{X‑Athena‑Auth‑Bearer‑Token} headers respectively.  This facilitates server‑side session forwarding when the gateway needs to inspect auth context.
+
+The SDK also includes an \emph{auth client} for calling Athena Auth APIs.  Methods such as \texttt{auth.signIn.email()}, \texttt{auth.getSession()}, \texttt{auth.signOut()} and admin functions like \texttt{auth.admin.email.template.create()} allow applications to manage users and templates programmatically.  React email templates can be passed as components.
+
+For strong typing, developers can opt into a generated schema registry.  The SDK provides a DSL to define tables, columns and enumerations and to create a typed client that enforces column names at compile time.  A command-line generator can introspect a Postgres database or Athena server and emit TypeScript definitions.  Strict mode optionally type‑checks column names in string selects.
+
+\subsection{Python SDK (\texttt{athena-py})}
+
+\texttt{athena-py} is an asynchronous Python client for the Athena gateway.  It mirrors the JS SDK’s shape with methods like \texttt{from\_()}, \texttt{rpc()} and \texttt{query()}, and exposes an additive \texttt{client.db} namespace.  Chains are awaitable, enabling succinct coroutines:
+\begin{lstlisting}[language=Python]
+from athena_py import create_client
+
+athena = create_client("https://athena-cluster.com", "athena_api_key", client="my-app")
+
+result = await athena.db.from_("users")\
+    .select("id,email")\
+    .eq("active", True)\
+    .order("created_at", ascending=False)\
+    .limit(20)
+
+if result.error:
+    raise RuntimeError(result.error.message)
+print(result.data)
+\end{lstlisting}
+
+Python keywords that conflict with method names (\texttt{from}, \texttt{is}, \texttt{in}, \texttt{not} or \texttt{or}) are suffixed with underscores, e.g., \texttt{from\_()}.  Experimental features include query tracing and a \texttt{find\_many()} AST transport.  The SDK is installed via \texttt{pip} and includes development scripts for testing, type‑checking and packaging.
+
+\section{Kubernetes Operator}
+
+The \texttt{athena-operator} project is a Kubernetes operator written in Go.  It defines custom resources and controllers to deploy Athena Gateway within a cluster and to reconcile certain server‑side resources.  Two initial custom resources are supported:
+\begin{itemize}
+  \item \textbf{AthenaGateway (cluster‑scoped)} – deploys a \texttt{Deployment} and \texttt{Service} for the gateway and exposes the service endpoint through its status.
+  \item \textbf{AthenaClient (namespaced)} – registers, updates or deletes an Athena client by calling the server’s \texttt{/admin/clients} API.  One client corresponds to one database.
+\end{itemize}
+
+Additional CRDs manage API key rights and API keys.  Future enhancements include schema management, pipelines, backups and functions.  The operator interacts with the gateway via the in‑cluster service endpoint rather than an external mirror.  Administrators must store the Athena admin key in a Kubernetes Secret, and API keys are never written to CRD status fields; secrets are used for sensitive material.  Quickstart guides are provided for newcomers to Kubernetes.
+
+\section{Model Context Protocol (athena-mcp)}
+
+The \texttt{athena-mcp} package exposes the Athena management API as a set of tool calls suitable for LLM agents or code assistants.  Its schema tools can list tables, schemas, views, extensions, keys and indexes, fetch table metadata, sample rows or search columns.  It also provides functions to execute SQL, insert/update/delete rows, and retrieve logs and migrations.  Additional calls manage clients, API keys, registry entries and metrics, and run config‑driven pipelines.  A read‑only mode prevents destructive operations.  Installation is available via npm or through direct invocation with \texttt{npx}.  The README also describes how to configure MCP servers in editors such as Cursor, VS Code, Claude, Windsurf and Zed.
+
+\section{Cluster and Deployment Considerations}
+
+Athena is intended to run in containerised environments.  The recommended deployment pattern is:
+\begin{enumerate}
+  \item Run the Athena Gateway (\texttt{athena\_rs}) inside a container or Kubernetes \texttt{Deployment} with a configuration file defining clients, gateway settings and environment variables.
+  \item Optionally run \texttt{athena-daemon} or enable the built‑in daemon mode to host background workers for deferred queries, backups, vacuum health collection and pipelines.  In multi‑instance clusters the daemon may be run as a separate deployment to avoid duplicated work.
+  \item Provision persistent storage for the \texttt{athena_logging} Postgres database that stores logs, client definitions, API keys and deferred queues.  Production setups often colocate the logging database with a dedicated Postgres instance.
+  \item Secure the gateway by enforcing TLS, rotating API keys and limiting network access to trusted clients.  Use the authentication framework to manage sessions and 2FA, and configure rate limiting to mitigate abuse.
+  \item For multi‑tenant deployments, configure tenant headers and mapping in Athena Auth and adopt the multi‑tenant runtime registry design.  This allows multiple logical projects to share one auth server while ensuring strict separation.
+\end{enumerate}
+
+On scaling: the asynchronous architecture and connection pooling support vertical scaling to many concurrent connections, but high write throughput should consider the deferred queue.  Horizontal scaling requires an external Redis or cache to share cache state and a common Postgres logging database to coordinate the client registry and deferred jobs.
+
+\section{Conclusion}
+
+Athena is a robust platform for building data‑driven applications: it abstracts database operations behind a unified HTTP interface, integrates a powerful authentication system, offers rich client SDKs, and provides operator support for seamless deployment in Kubernetes clusters.  Its Rust foundation leverages asynchronous I/O and fine‑grained pooling to deliver high throughput and resiliency.  With features like deferred execution, caching, rate limiting, API key management and detailed observability, Athena can serve as the backbone of data services ranging from microservices to large multi‑tenant platforms.
+
+\end{document}
