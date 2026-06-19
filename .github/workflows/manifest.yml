@@ -1,0 +1,124 @@
+name: Build papers and README manifest
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/*.tex"
+      - "**/*.pdf"
+      - ".github/workflows/papers-manifest.yml"
+      - "scripts/generate_papers_readme.py"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: papers-manifest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-papers:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install LaTeX toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            latexmk \
+            texlive-latex-base \
+            texlive-latex-recommended \
+            texlive-latex-extra \
+            texlive-fonts-recommended \
+            texlive-fonts-extra \
+            texlive-science \
+            texlive-bibtex-extra \
+            biber \
+            ghostscript
+
+      - name: Compile all .tex files to PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p .latex-build
+
+          mapfile -d '' TEX_FILES < <(
+            find . \
+              -type f \
+              -name '*.tex' \
+              ! -path './.git/*' \
+              ! -path './.latex-build/*' \
+              ! -path './node_modules/*' \
+              ! -path './target/*' \
+              -print0 | sort -z
+          )
+
+          if [ "${#TEX_FILES[@]}" -eq 0 ]; then
+            echo "No .tex files found."
+            exit 0
+          fi
+
+          for tex in "${TEX_FILES[@]}"; do
+            echo "Compiling $tex"
+
+            clean="${tex#./}"
+            dir="$(dirname "$clean")"
+            base="$(basename "$clean" .tex)"
+            build_dir="$PWD/.latex-build/${clean%.tex}"
+
+            mkdir -p "$build_dir"
+
+            latexmk \
+              -pdf \
+              -cd \
+              -interaction=nonstopmode \
+              -halt-on-error \
+              -file-line-error \
+              -synctex=0 \
+              -outdir="$build_dir" \
+              "$PWD/$clean"
+
+            if [ -f "$build_dir/$base.pdf" ]; then
+              cp "$build_dir/$base.pdf" "$PWD/$dir/$base.pdf"
+            else
+              echo "Expected PDF not found: $build_dir/$base.pdf"
+              exit 1
+            fi
+          done
+
+      - name: Generate README manifest
+        run: |
+          python3 scripts/generate_papers_readme.py
+
+      - name: Commit generated README and PDFs
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add README.md
+
+          find . \
+            -type f \
+            -name '*.pdf' \
+            ! -path './.git/*' \
+            ! -path './.latex-build/*' \
+            ! -path './node_modules/*' \
+            ! -path './target/*' \
+            -print0 | xargs -0 git add
+
+          if git diff --cached --quiet; then
+            echo "No README/PDF changes to commit."
+            exit 0
+          fi
+
+          git commit -m "docs: update papers manifest and PDFs"
+          git push
