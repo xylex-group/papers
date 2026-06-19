@@ -1,0 +1,465 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{parskip}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue,
+  pdftitle={Athena Unified Routing and SDK Bundling Design},
+  pdfauthor={OpenAI}
+}
+
+\lstdefinelanguage{TypeScriptAthena}{
+  language=Java,
+  morekeywords={type,interface,await,async,const,let,import,from,true,false,null,undefined,export,return},
+  sensitive=true,
+  morecomment=[l]{//},
+  morestring=[b]",
+  morestring=[b]',
+}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  tabsize=2
+}
+
+\title{Athena Unified Routing for Subdomain Coverage and SDK Bundling}
+\date{June 19, 2026}
+
+\begin{document}
+\maketitle
+
+\section{Executive Summary}
+
+Athena should keep \texttt{createClient(url, key)} as the canonical SDK entrypoint and treat \texttt{url} as the single public Athena origin. The SDK should derive service paths from that base URL, while still permitting explicit per-service overrides for self-hosting, migrations, and debugging.
+
+The recommended public contract is:
+
+\begin{lstlisting}[language=TypeScriptAthena]
+const athena = createClient("https://<tenant>.<major>.<domain>", ATHENA_API_KEY)
+
+// Derived internally by the SDK:
+// DB:        https://<tenant>.<major>.<domain>/db
+// Auth:      https://<tenant>.<major>.<domain>/auth
+// Storage:   https://<tenant>.<major>.<domain>/storage
+// Realtime:  https://<tenant>.<major>.<domain>/realtime
+\end{lstlisting}
+
+Internally, the Rust Athena server should act as a policy-aware reverse proxy and router. It should parse tenant and major version from the host, parse the module from the first path segment, and then dispatch the request to the appropriate upstream service. That upstream can be local, internal HTTP, internal HTTPS, or WebSocket. The client should not need to know whether the services are physically separate.
+
+The strongest recommendation is to make the \emph{path-based} unified origin canonical and keep \emph{subdomain-based} service splits as optional aliases only. This reduces browser-origin complexity, simplifies cookies and OAuth flows, and preserves the ergonomic SDK surface.
+
+\section{Inputs Used}
+
+This design is grounded in four Athena-specific inputs and one external architectural analogue:
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item Athena JS examples already use a canonical \texttt{createClient(url, key, options)} surface and support separate auth configuration via options rather than forcing a separate public entrypoint for every service.\footnote{Athena JS examples show \texttt{createClient(...)} as the primary entrypoint and auth-specific overrides such as \texttt{auth: \{ baseUrl: ... \}}.}
+  \item Athena gateway OpenAPI documents a single gateway surface and explicitly states that \texttt{/gateway/fetch} accepts both canonical nested \texttt{select} payloads and compatibility \texttt{select} strings.\footnote{The Athena RS OpenAPI notes that PostgreSQL-backed fetch execution accepts canonical nested \texttt{select} payloads and compatibility \texttt{select} strings.}
+  \item Athena Auth OpenAPI exposes a distinct auth route surface such as \texttt{/sign-in/email}, \texttt{/sign-in/social}, \texttt{/get-session}, and admin/auth-management routes, which makes it a clear module boundary for internal routing.\footnote{The Athena Auth OpenAPI shows a dedicated auth route family including sign-in, session, organization, passkey, and admin routes.}
+  \item Current Athena SDK direction already prefers Prisma-style nested object selection as the canonical read API, with string-based select retained as migration sugar only.\footnote{The Athena design notes explicitly state that \texttt{findMany\{ select: \{ ... \}\}} is the canonical API and that string-based \texttt{select(...)} should remain compatibility sugar.}
+  \item Public analogues such as Supabase validate the single-client, multi-module pattern: one public base URL, internally derived service URLs, and a gateway in front of multiple backend services.
+\end{enumerate}
+
+\section{Canonical Public SDK Shape}
+
+The canonical Athena shape should remain minimal:
+
+\begin{lstlisting}[language=TypeScriptAthena]
+const athena = createClient(url, key)
+\end{lstlisting}
+
+The public meaning of \texttt{url} should be: \emph{the public unified Athena base URL}. The SDK then derives module endpoints internally:
+
+\begin{lstlisting}[language=TypeScriptAthena]
+DB       = `${url}/db`
+Auth     = `${url}/auth`
+Storage  = `${url}/storage`
+Realtime = `${url}/realtime`
+\end{lstlisting}
+
+Advanced deployments should still be able to override individual services:
+
+\begin{lstlisting}[language=TypeScriptAthena]
+const athena = createClient({
+  url: "https://acme.v3.athena-db.com",
+  key: ATHENA_API_KEY,
+  db: { url: process.env.ATHENA_DB_URL },
+  auth: { url: process.env.ATHENA_AUTH_URL },
+  storage: { url: process.env.ATHENA_STORAGE_URL },
+  realtime: { url: process.env.ATHENA_REALTIME_URL },
+})
+\end{lstlisting}
+
+Legacy top-level aliases can remain as compatibility glue:
+
+\begin{lstlisting}[language=TypeScriptAthena]
+const athena = createClient({
+  key: ATHENA_API_KEY,
+  gatewayUrl: process.env.ATHENA_DB_URL,
+  authUrl: process.env.ATHENA_AUTH_URL,
+  storageUrl: process.env.ATHENA_STORAGE_URL,
+  realtimeUrl: process.env.ATHENA_REALTIME_URL,
+})
+\end{lstlisting}
+
+These aliases should not be the preferred long-term surface. They should exist only to preserve backwards compatibility while the unified contract becomes dominant.
+
+\section{Recommended Public URL Contract}
+
+The recommended canonical public form is:
+
+\begin{lstlisting}
+https://<tenant_ref>.<major_version>.<domain>/db/...
+https://<tenant_ref>.<major_version>.<domain>/auth/...
+https://<tenant_ref>.<major_version>.<domain>/storage/...
+https://<tenant_ref>.<major_version>.<domain>/realtime/...
+\end{lstlisting}
+
+This yields a clean separation of concerns:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Host = tenant and major-version scope.
+  \item First path segment = module selector.
+  \item Remaining path = module-local route.
+\end{itemize}
+
+Examples:
+
+\begin{lstlisting}
+https://acme.v3.athena-db.com/db/gateway/fetch
+https://acme.v3.athena-db.com/auth/sign-in/email
+https://acme.v3.athena-db.com/storage/files/upload-url
+wss://acme.v3.athena-db.com/realtime/socket
+\end{lstlisting}
+
+Optional aliases can still be accepted:
+
+\begin{lstlisting}
+https://db.acme.v3.athena-db.com/...
+https://auth.acme.v3.athena-db.com/...
+https://storage.acme.v3.athena-db.com/...
+wss://realtime.acme.v3.athena-db.com/...
+\end{lstlisting}
+
+But these should be documented as operator aliases, not as the canonical SDK assumption.
+
+\section{Why Path-Based Should Be Canonical}
+
+\subsection{Single browser origin}
+
+A path-based split keeps database, auth, storage, and realtime under a single origin. That materially simplifies:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item CORS behavior,
+  \item cookie scope,
+  \item OAuth and email callback handling,
+  \item browser credential forwarding,
+  \item session refresh and logout behavior.
+\end{itemize}
+
+A host-based split turns each service into a different origin. Even sibling subdomains are cross-origin in browsers. That means more preflights, more CORS surface, and harder session semantics.
+
+\subsection{Cleaner SDK mental model}
+
+The SDK should communicate one message: ``Athena has one public URL.'' Internally, Athena may still be many services. Publicly, it should look like one system.
+
+\subsection{Better migration and refactor freedom}
+
+If the public contract is one host with module suffixes, Athena can later:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item move a module to another service,
+  \item merge services back into one binary,
+  \item relocate services to another cluster,
+  \item introduce caching or rate-limiting per module,
+  \item special-case realtime or storage transport,
+\end{itemize}
+
+without breaking the SDK or the public API shape.
+
+\section{Rust Router Design}
+
+The Rust Athena front door should operate as a reverse proxy plus routing policy layer.
+
+\subsection{Resolution inputs}
+
+Each inbound request resolves from:
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Host}: extract \texttt{tenant\_ref} and \texttt{major\_version}.
+  \item \textbf{Path prefix}: extract module \texttt{db}, \texttt{auth}, \texttt{storage}, or \texttt{realtime}.
+  \item \textbf{Remaining path}: forward to module-local route.
+  \item \textbf{Method and upgrade state}: decide whether ordinary HTTP or WebSocket forwarding applies.
+\end{enumerate}
+
+\subsection{Router pseudocode}
+
+\begin{lstlisting}[language=Rust]
+match module {
+    "db" => proxy_http(cfg.db_upstream, strip_prefix("/db")),
+    "auth" => proxy_http(cfg.auth_upstream, strip_prefix("/auth")),
+    "storage" => proxy_http(cfg.storage_upstream, strip_prefix("/storage")),
+    "realtime" if is_websocket(req) => {
+        proxy_ws(cfg.realtime_ws_upstream, strip_prefix("/realtime"))
+    }
+    "realtime" => {
+        proxy_http(cfg.realtime_http_upstream, strip_prefix("/realtime"))
+    }
+    _ => not_found(),
+}
+\end{lstlisting}
+
+\subsection{Upstream registry}
+
+The routing decision should not be hardcoded only by module. It should be resolved from:
+
+\begin{lstlisting}
+{ tenant_ref, major_version, module }
+\end{lstlisting}
+
+into an upstream descriptor such as:
+
+\begin{lstlisting}
+db        -> https://gateway.internal.local
+auth      -> http://auth.service:3001
+storage   -> https://storage.internal.local
+realtime  -> ws://realtime.service:4000 + http://realtime.service:4000
+\end{lstlisting}
+
+This gives Athena the flexibility to keep some modules local to the Rust binary and proxy others to external services.
+
+\section{Module Mapping Strategy}
+
+\subsection{DB module}
+
+\texttt{/db} should normally forward into the existing Athena gateway/query surface. Because Athena RS already exposes \texttt{/gateway/fetch}, \texttt{/gateway/query}, \texttt{/gateway/rpc}, and related operations, the DB module can either:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item forward \texttt{/db/...} into those existing internal routes, or
+  \item progressively normalize public DB routes so the external surface becomes cleaner over time.
+\end{itemize}
+
+Near-term compatibility can simply preserve the current gateway surface under the DB module.
+
+\subsection{Auth module}
+
+\texttt{/auth} should forward into the Athena Auth server route family:
+
+\begin{lstlisting}
+/auth/sign-in/email
+/auth/sign-in/social
+/auth/get-session
+/auth/sign-out
+/auth/organization/...
+/auth/passkey/...
+\end{lstlisting}
+
+This preserves a clean separation while still keeping one public base origin.
+
+\subsection{Storage module}
+
+\texttt{/storage} should front file URL creation, file proxying, download, and upload URL issuance. The Athena JS examples already show storage as a first-class SDK module, which fits naturally into the unified contract.
+
+\subsection{Realtime module}
+
+\texttt{/realtime} is special because it may need both HTTP and WebSocket behavior. The router should inspect upgrade semantics and forward accordingly.
+
+\section{SDK Bundling Strategy}
+
+The SDK should continue to be one package that exposes multiple module capabilities from one factory. The client object can remain structured:
+
+\begin{lstlisting}[language=TypeScriptAthena]
+const athena = createClient(url, key)
+
+athena.from(...)
+athena.rpc(...)
+athena.auth.signIn.email(...)
+athena.storage.createStorageUploadUrl(...)
+athena.realtime.channel(...)
+\end{lstlisting}
+
+This does \emph{not} require the backend services to be physically co-located. It only requires the SDK to resolve them from one public contract.
+
+That means Athena can be:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item one public origin,
+  \item one SDK package,
+  \item many internal services.
+\end{itemize}
+
+That is the desired architecture.
+
+\section{Compatibility With Existing Athena Read API Direction}
+
+Athena already prefers a canonical object-AST read surface:\footnote{The Athena design notes explicitly define \texttt{findMany\{ select: \{ ... \}\}} as the canonical style and treat string \texttt{select(...)} as migration sugar.}
+
+\begin{lstlisting}[language=TypeScriptAthena]
+const { data, error } = await athena
+  .from("orchestral_sections")
+  .findMany({
+    select: {
+      name: true,
+      instruments: {
+        select: {
+          name: true,
+        },
+      },
+    },
+  })
+\end{lstlisting}
+
+The current Athena gateway OpenAPI also already documents that \texttt{/gateway/fetch} accepts:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item nested object \texttt{select} payloads, and
+  \item string \texttt{select} payloads for compatibility.
+\end{itemize}
+
+This is important because it means the router work does \emph{not} require a new public data model. It only requires public module routing in front of the existing capability.
+
+In other words:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item SDK bundling is already aligned.
+  \item Canonical object AST is already aligned.
+  \item Gateway transport already has the right direction.
+  \item The missing layer is the unified front-door router.
+\end{itemize}
+
+\section{Security and Transport Requirements}
+
+\subsection{Header forwarding}
+
+The router should preserve only the right end-to-end headers and strip hop-by-hop headers. It should also add normalized forwarding metadata and request IDs.
+
+\subsection{Authentication propagation}
+
+The front door should consistently propagate:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item API key headers,
+  \item bearer tokens,
+  \item Athena session-token mirrors,
+  \item tenant headers where applicable,
+  \item request correlation IDs.
+\end{itemize}
+
+\subsection{Cookies}
+
+If Auth is routed under the same public host, cookie handling becomes far more predictable. This is another reason the unified path-based public form is preferable.
+
+\subsection{CORS}
+
+CORS should be minimized, not embraced. The clean design target is that most browser calls never become cross-origin in the first place.
+
+\subsection{WebSockets}
+
+Realtime needs explicit upgrade-aware handling and separate health checks. It should not be treated as ordinary REST pass-through.
+
+\section{Migration Plan}
+
+\subsection*{Phase 1: Preserve existing service URLs}
+
+Keep all current direct service URLs operational.
+
+\subsection*{Phase 2: Add unified front door}
+
+Introduce:
+
+\begin{lstlisting}
+https://<tenant>.<major>.<domain>/db
+https://<tenant>.<major>.<domain>/auth
+https://<tenant>.<major>.<domain>/storage
+https://<tenant>.<major>.<domain>/realtime
+\end{lstlisting}
+
+and internally route them to existing services.
+
+\subsection*{Phase 3: Make SDK derive module paths from one URL}
+
+Document \texttt{createClient(url, key)} as canonical. Retain per-service overrides and legacy aliases.
+
+\subsection*{Phase 4: Make subdomain service hosts optional aliases}
+
+Accept host-based forms if operators want them, but document them as advanced or compatibility forms.
+
+\subsection*{Phase 5: Normalize docs and examples}
+
+All first-party docs should show:
+
+\begin{lstlisting}[language=TypeScriptAthena]
+const athena = createClient("https://acme.v3.athena-db.com", key)
+\end{lstlisting}
+
+not explicit separate public module origins.
+
+\section{Recommended Rust Implementation Stack}
+
+A pragmatic implementation stack is:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Axum} for request routing and extraction,
+  \item \textbf{axum-extra Host extractor} or equivalent for host parsing,
+  \item \textbf{hyper / hyper-util} for upstream client forwarding,
+  \item \textbf{tower / tower-http} for timeout, tracing, request IDs, and concurrency control.
+\end{itemize}
+
+Implementation priorities:
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item Resolve host into \texttt{tenant\_ref} and \texttt{major\_version}.
+  \item Resolve first path segment into module.
+  \item Rewrite path for upstream.
+  \item Forward method, query string, headers, and body.
+  \item Handle WebSocket upgrades for realtime.
+  \item Emit tracing and request IDs at the gateway boundary.
+  \item Apply per-module policies such as rate limits and timeouts.
+\end{enumerate}
+
+\section{Final Recommendation}
+
+The answer is yes: Athena can absolutely expose one public URL while routing internally to fully separate auth, database, storage, and realtime services.
+
+The best final design is:
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \texttt{createClient(url, key)} remains canonical.
+  \item \texttt{url} means the public unified Athena origin.
+  \item The SDK derives \texttt{/db}, \texttt{/auth}, \texttt{/storage}, and \texttt{/realtime} internally.
+  \item The Rust Athena front door routes those module suffixes to whatever real internal upstreams exist.
+  \item Per-service overrides remain supported.
+  \item Separate public service subdomains remain optional aliases only.
+\end{enumerate}
+
+This preserves backwards compatibility, improves browser ergonomics, keeps the SDK clean, and gives Athena maximum architectural freedom internally.
+
+\section*{Athena-Specific Evidence Notes}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item Athena JS examples and docs show \texttt{createClient(...)} as the default client initialization surface, including support for auth-specific base URL configuration and tenant header injection.
+  \item Athena RS OpenAPI already documents a unified gateway surface and explicitly supports canonical nested \texttt{select} payloads plus compatibility string \texttt{select} payloads on \texttt{/gateway/fetch}.
+  \item Athena Auth OpenAPI clearly exposes a separate auth route family suitable for mounting under \texttt{/auth}.
+  \item Athena design notes explicitly state that nested object \texttt{findMany} is the canonical query style and string \texttt{select} should be compatibility sugar only.
+\end{itemize}
+
+\end{document}
